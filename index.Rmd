@@ -1,0 +1,183 @@
+---
+title: "Gene Expression Meta-analysis"
+author: "Levi Waldron"
+date: "March 21, 2015"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+---
+
+# Needed libraries
+
+```{r, echo=TRUE, message=FALSE, cache=FALSE}
+library(curatedOvarianData)
+library(logging)
+library(affy)
+library(survival)
+library(metafor)
+```
+
+# Sample selection
+Following the vignette of curatedOvarianData, this code chunk creates a list of ExpressionSets, containing all patients who are annotated for censored overall survival (days_to_death and vital_status).  The arguments in patientselection.config also result in keeping only genes present in all studies, and in scaling these to unit variance before sample filtering.
+
+```{r, cache=TRUE, message=FALSE}
+source(system.file("extdata", "patientselection.config",package="curatedOvarianData"))
+keep.common.only <- TRUE
+source(system.file("extdata", "createEsetList.R", package = "curatedOvarianData"))
+esets <- esets[!grepl("TCGA.RNASeqV2_eset", names(esets))]
+```
+
+# A useful meta-analysis function
+This function is copied from the curatedOvarianData vignette, with an added argument plot=TRUE to allow use of the function without creating a forest plot.  Here we use this to perform meta-analysis on all genes in a loop.
+
+```{r, echo=TRUE}
+forestplot <- function(esets, y="y", probeset, formula=y~probeset,
+mlab="Overall", rma.method="FE", at=NULL,xlab="Hazard Ratio", plot=TRUE, ...) {
+    require(metafor)
+    esets <- esets[sapply(esets, function(x) probeset %in% featureNames(x))]
+    coefs <- sapply(1:length(esets), function(i) {
+        tmp   <- as(phenoData(esets[[i]]), "data.frame")
+        tmp$y <- esets[[i]][[y]]
+        tmp$probeset <- exprs(esets[[i]])[probeset,]
+        summary(coxph(formula,data=tmp))$coefficients[1,c(1,3)]
+    })  
+
+    res.rma <- metafor::rma(yi = coefs[1,], sei = coefs[2,], 
+        method=rma.method)
+
+    if (is.null(at)) at <- log(c(0.25,1,4,20))
+    if(plot){
+      forest.rma(res.rma, xlab=xlab, slab=gsub("_eset$","",names(esets)),
+      atransf=exp, at=at, mlab=mlab,...)
+    }
+    return(res.rma)
+}
+```
+
+# Perform meta-analysis on all genes
+
+First using a fixed-effects model:
+```{r allmetafor, cache=TRUE, echo=TRUE}
+fe.metafor <- lapply(featureNames(esets[[1]]), function(probeset){
+  forestplot(esets, y="y", probeset=probeset, plot=FALSE)
+})
+names(fe.metafor) <- featureNames(esets[[1]])
+```
+
+# Then using a random-effects model
+
+Note the use of try() here because the random-effects fit does not converge for some genes.
+
+```{r allmetaforRE, cache=TRUE, message=FALSE}
+reml.metafor <- lapply(featureNames(esets[[1]]), function(probeset){
+  try(forestplot(esets, y="y", probeset=probeset, rma.method="REML", control=list(maxiter=1000, stepadj=0.5), plot=FALSE))
+})
+names(reml.metafor) <- featureNames(esets[[1]])
+```
+
+We now remove from the analysis any genes for which the random-effects fit did not converge.
+```{r}
+idx.noconv <- sapply(reml.metafor, function(x) is(x, "try-error"))
+reml.metafor <- reml.metafor[!idx.noconv]
+fe.metafor <- fe.metafor[!idx.noconv]
+```
+
+Extract the Q-test p-value, and the Cox model p-values synthesized by fixed-effects and random-effects models.
+```{r, cache=TRUE}
+QEp <- sapply(fe.metafor, function(one.metafor) one.metafor$QEp)
+#QE <- sapply(fe.metafor, function(one.metafor) one.metafor$QE)
+coxp.fe <- sapply(fe.metafor, function(one.metafor) one.metafor$pval)
+coxp.re <- sapply(reml.metafor, function(one.metafor) one.metafor$pval)
+```
+
+# All p-values from Cochrane's Q test:
+```{r Qhistogram}
+hist(QEp, main="p-value from Cochrane's Q test", xlab="P-value")
+```
+
+# Forest plot for top survival-associated gene
+
+First note that the top-ranked gene is the same whether using fixed-effects or random-effects meta-analysis:
+
+```{r}
+(idx.fe <- which.min(coxp.fe))
+(idx.re <- which.min(coxp.re))
+```
+
+The synthesized result is identical by random or fixed-effects meta-analysis:
+```{r forestmaxcox, message=FALSE, echo=TRUE}
+probesets <- names(fe.metafor)
+forest.rma(reml.metafor[[idx.re]], slab=sub("_eset", "", names(esets)), 
+                      main=paste("Top-ranked gene for survival association:", probesets[idx.re],
+                      "\n Q-test p-value =", signif(QEp[idx.re], 2)))
+addpoly(fe.metafor[[idx.re]], annotate=FALSE, col="grey")
+```
+
+# Analysis of gene with greatest evidence of heterogeneity
+
+## Forest plot
+```{r forestmaxhet, echo=TRUE}
+idx.het <- which.min(QEp)
+forest.rma(reml.metafor[[idx.het]], slab=sub("_eset", "", names(esets)), 
+                      main=paste("Gene with maximum heterogeneity:", probesets[idx.het],
+                      "\n Q-test p-value =", signif(QEp[idx.het], 2)))
+addpoly(fe.metafor[[idx.het]], annotate=FALSE, col="grey")
+```
+
+## Association between Cox coefficient and covariates
+
+First we create a dataframe containing fractions of patients who are suboptimally debulked, serous subtype, high-grade, late-stage, and over 70 years of age.
+
+```{r}
+covars <- sapply(esets, function(eset){
+  output <- c(sum(eset$debulking == "suboptimal", na.rm=TRUE) / sum(!is.na(eset$debulking)), 
+  sum(eset$histological_type == "ser", na.rm=TRUE) / sum(!is.na(eset$histological_type)), 
+  sum(eset$summarygrade == "high", na.rm=TRUE) / sum(!is.na(eset$summarygrade)),
+  sum(eset$summarystage == "late", na.rm=TRUE) / sum(!is.na(eset$summarystage)),
+  sum(eset$age > 70, na.rm=TRUE)/sum(!is.na(eset$age)))
+  names(output) <- c("suboptimal", "serous", "highgrade", "latestage", "old")
+  return(output)
+})
+covars <- t(covars)
+covars[is.nan(covars)] <- NA
+covars <- data.frame(covars)
+```
+
+Add the Cox regression coefficients (log HR) and sample size:
+```{r}
+covars$estimates <- fe.metafor[[idx.het]]$yi
+covars$n <- sapply(esets, ncol)
+```
+
+P-values from simple linear regression between the proportion of each covariate and the Cox coefficient:
+```{r}
+covars.assocs <- sapply(1:5, function(i){
+  dat <- covars[, c(i, 6, 7)]
+  dat <- dat[complete.cases(dat), ]
+  anova(lm(dat[, 2] ~ dat[, 1], weights=dat$n))[["Pr(>F)"]][1]
+  })
+```
+
+Create a dataframe with just the covariate whose proportion is most associated with Cox coefficient.  Do a linear regression with points weighted by the sample size of the study.
+```{r}
+dat <- covars[, c(which.min(covars.assocs), 6:7)]
+dat <- dat[complete.cases(dat), ]
+my.lm <- lm(dat[, 2] ~ dat[, 1], weights=dat$n)
+```
+
+Finally, plot the association between the proportion of sub-optimally debulked patients in each dataset against the Cox regression coefficient for that dataset.  Points are sized with cex=sqrt(n) so that the area of the circles is proportional to sample size.
+```{r coxvsdebulking}
+plot(dat[, 1:2], cex=sqrt(dat$n / sum(dat$n)) * 5,
+     xlab=paste0("% ", colnames(covars)[which.min(covars.assocs)], "ly debulked"), 
+     ylab=paste(probesets[idx.het], "Cox coefficient"))
+abline(my.lm)
+legend("topleft", legend=paste("P =", signif(covars.assocs[which.min(covars.assocs)], 1)), bty="n")
+```
+
+# Session Info
+```{r}
+library(devtools)
+session_info()
+```
+
